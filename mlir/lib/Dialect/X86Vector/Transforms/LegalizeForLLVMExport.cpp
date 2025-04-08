@@ -12,6 +12,7 @@
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/X86Vector/X86VectorDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
@@ -144,7 +145,6 @@ struct CvtPackedF32ToBF16Conversion
 
     auto opType = op.getDst().getType();
     auto opA = op.getA();
-
     switch (opBitWidth) {
     case 256: {
       rewriter.replaceOpWithNewOp<CvtNeF32ToBF16Ps256IntrOp>(op, opType, opA);
@@ -157,6 +157,41 @@ struct CvtPackedF32ToBF16Conversion
     default: {
       return rewriter.notifyMatchFailure(
           op, "unsupported AVX512-BF16 packed f32 to bf16 variant");
+    }
+    }
+
+    return success();
+  }
+};
+
+struct CvtPackedEvenIndexedBF16ToF32Conversion
+    : public ConvertOpToLLVMPattern<CvtPackedEvenIndexedBF16ToF32Op> {
+  using ConvertOpToLLVMPattern<CvtPackedEvenIndexedBF16ToF32Op>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(CvtPackedEvenIndexedBF16ToF32Op op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+	  mlir::MLIRContext context;
+	  context.loadDialect<mlir::LLVM::LLVMDialect>();
+    auto typeA = dyn_cast<MemRefType>(op.getA().getType());
+    unsigned elemBitWidth = typeA.getElementTypeBitWidth();
+    unsigned opBitWidth = typeA.getShape()[0] * elemBitWidth;
+
+    auto opType = op.getDst().getType();
+    auto opA = op.getA();
+    
+    switch (opBitWidth) {
+    case 128: {
+      rewriter.replaceOpWithNewOp<CvtNeeBF16ToF32Ps128IntrOp>(op, opType, opA);
+      break;
+    }
+    case 256: {
+      rewriter.replaceOpWithNewOp<CvtNeeBF16ToF32Ps256IntrOp>(op, opType, opA);
+      break;
+    }
+    default: {
+      return rewriter.notifyMatchFailure(
+          op, "TBA");
     }
     }
 
@@ -237,7 +272,7 @@ void mlir::populateX86VectorLegalizeForLLVMExportPatterns(
   Registry::registerPatterns(converter, patterns);
   patterns
       .add<MaskCompressOpConversion, DotBF16OpConversion,
-           CvtPackedF32ToBF16Conversion, RsqrtOpConversion, DotOpConversion>(
+           CvtPackedF32ToBF16Conversion, CvtPackedEvenIndexedBF16ToF32Conversion, RsqrtOpConversion, DotOpConversion>(
           converter);
 }
 
@@ -253,6 +288,9 @@ void mlir::configureX86VectorLegalizeForExportTarget(
   target.addLegalOp<CvtNeF32ToBF16Ps256IntrOp>();
   target.addLegalOp<CvtNeF32ToBF16Ps512IntrOp>();
   target.addIllegalOp<CvtPackedF32ToBF16Op>();
+  target.addLegalOp<CvtNeeBF16ToF32Ps128IntrOp>();
+  target.addLegalOp<CvtNeeBF16ToF32Ps256IntrOp>();
+  target.addIllegalOp<CvtPackedEvenIndexedBF16ToF32Op>();
   target.addLegalOp<RsqrtIntrOp>();
   target.addIllegalOp<RsqrtOp>();
   target.addLegalOp<DotIntrOp>();

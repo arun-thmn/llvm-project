@@ -16,6 +16,8 @@
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Dialect/LLVMIR/LLVMOpBase.td"
+include "mlir/Dialect/LLVMIR/LLVMTypes.td"
+include "mlir/Dialect/LLVMIR/LLVMDialect.td"
 
 //===----------------------------------------------------------------------===//
 // X86Vector dialect definition
@@ -401,6 +403,13 @@ class AVX_IntrOp<string mnemonic, int numResults, list<Trait> traits = []> :
                   "x86_avx_" # !subst(".", "_", mnemonic),
                   [], [], traits, numResults>;
 
+// Intrinsic operation used during lowering to LLVM IR.
+class X86_IntrOp<string mnemonic, int numResults, list<Trait> traits = []> :
+  LLVM_IntrOpBase<X86Vector_Dialect, "avx.intr." # mnemonic,
+                  "x86_" # !subst(".", "_", mnemonic),
+                  [], [], traits, numResults>;
+
+
 //----------------------------------------------------------------------------//
 // AVX Rsqrt
 //----------------------------------------------------------------------------//
@@ -451,5 +460,30 @@ def DotIntrOp : AVX_IntrOp<"dp.ps.256", 1, [Pure,
                        VectorOfLengthAndType<[8], [F32]>:$b, I8:$c);
   let results = (outs VectorOfLengthAndType<[8], [F32]>:$res);
 }
+
+
+//----------------------------------------------------------------------------//
+// AVX: Convert packed BF16 even-indexed elements into packed F32
+//----------------------------------------------------------------------------//
+
+def CvtPackedEvenIndexedBF16ToF32Op : AVX_Op<"cvt.packed.even.indexed.bf16_to_f32", [Pure]> {
+  let summary = "AVX: Convert packed BF16 even-indexed elements into packed F32 Data.";
+  let arguments = (ins LLVM_AnyPointer:$a);
+  let results = (outs VectorOfLengthAndType<[4, 8], [F32]>:$dst);
+  let assemblyFormat =
+    "$a  attr-dict`:` type($a)`->` type($dst)";
+}
+
+
+def CvtNeeBF16ToF32Ps128IntrOp : X86_IntrOp<"vcvtneebf162ps128", 1, [Pure]> {
+  let arguments = (ins LLVM_AnyPointer:$a);
+  let results = (outs VectorOfLengthAndType<[4], [F32]>:$res);
+}
+
+def CvtNeeBF16ToF32Ps256IntrOp : X86_IntrOp<"vcvtneebf162ps256", 1, [Pure]> {
+  let arguments = (ins LLVM_AnyPointer:$a);
+  let results = (outs VectorOfLengthAndType<[8], [F32]>:$res);
+}
+
 
 #endif // X86VECTOR_OPS
