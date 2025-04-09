@@ -12,7 +12,6 @@
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/X86Vector/X86VectorDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
@@ -171,15 +170,13 @@ struct CvtPackedEvenIndexedBF16ToF32Conversion
   LogicalResult
   matchAndRewrite(CvtPackedEvenIndexedBF16ToF32Op op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-	  mlir::MLIRContext context;
-	  context.loadDialect<mlir::LLVM::LLVMDialect>();
-    auto typeA = dyn_cast<MemRefType>(op.getA().getType());
-    unsigned elemBitWidth = typeA.getElementTypeBitWidth();
-    unsigned opBitWidth = typeA.getShape()[0] * elemBitWidth;
+    auto typeDst = dyn_cast<VectorType>(op.getDst().getType());
+    unsigned elemBitWidth = typeDst.getElementTypeBitWidth();
+    unsigned opBitWidth = typeDst.getShape()[0] * elemBitWidth;
 
     auto opType = op.getDst().getType();
     auto opA = op.getA();
-    
+
     switch (opBitWidth) {
     case 128: {
       rewriter.replaceOpWithNewOp<CvtNeeBF16ToF32Ps128IntrOp>(op, opType, opA);
@@ -191,7 +188,7 @@ struct CvtPackedEvenIndexedBF16ToF32Conversion
     }
     default: {
       return rewriter.notifyMatchFailure(
-          op, "TBA");
+          op, "unsupported AVX-BF16 packed f32 to bf16 variant");
     }
     }
 

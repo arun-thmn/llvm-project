@@ -16,8 +16,6 @@
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Dialect/LLVMIR/LLVMOpBase.td"
-include "mlir/Dialect/LLVMIR/LLVMTypes.td"
-include "mlir/Dialect/LLVMIR/LLVMDialect.td"
 
 //===----------------------------------------------------------------------===//
 // X86Vector dialect definition
