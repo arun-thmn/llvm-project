@@ -52,6 +52,11 @@ void mlir::transform::ApplyVectorContractToAMXDotProductPatternsOp::
   x86::populateVectorContractToAMXDotProductPatterns(patterns);
 }
 
+void mlir::transform::ApplyVectorContractToACEOuterProductPatternsOp::
+    populatePatterns(RewritePatternSet &patterns) {
+  x86::populateVectorContractToACEOuterProductPatterns(patterns);
+}
+
 //===----------------------------------------------------------------------===//
 // Transform op registration
 //===----------------------------------------------------------------------===//

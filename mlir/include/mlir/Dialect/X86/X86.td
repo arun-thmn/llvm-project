@@ -749,6 +749,8 @@ def AMXTileF32 : AMXTileOf<[F32]>;
 
 def AMXTileF16OrBF16OrF8 : AMXTileOf<[F16, BF16, F8E4M3FN, F8E5M2]>;
 
+def AMXTileF32OrI32 : AMXTileOf<[F32, I32]>;
+
 def AMXTileI32 : AMXTileOf<[I32]>;
 
 def AMXTileI8 : AMXTileOf<[I8]>;
@@ -950,6 +952,213 @@ def TileStoreOp : AMX_Op<"tile_store", [
   }];
   let assemblyFormat = "$base `[` $indices `]` `,` $val (`,` $stride^ )?"
                        "attr-dict `:` type($base) `,` qualified(type($val))";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// AMX Tile Mov Row
+//===----------------------------------------------------------------------===//
+
+def TileMovRowOp :
+  AMX_Op<"tilemovrow", [Pure, X86IntrinsicOpInterface]> {
+
+  let summary = "Extract one AMX tile row as vector<16xi32>";
+  let description = [{
+  Extracts a single row from an AMX tile and returns it as a
+  `vector<16xi32>`.
+
+  The operation takes the tile dimensions (`rows` and `colsb`), the source
+  AMX tile (`tile`), and the zero-based row index (`rowIndex`) identifying
+  the row to extract.
+
+  Example:
+  ```mlir
+      %0 = x86.amx.tilemovrow %rows, %colsb, %tile, %row
+        : (i16, i16, !x86.amx.tile<16x16xi32>, i32) -> vector<16xi32>
+  ```
+  }];
+
+  let arguments = (ins
+    I16:$rows,
+    I16:$colsb,
+    AMXTileF32OrI32:$tile,
+    I32:$rowIndex
+  );
+  let results = (outs VectorOfLengthAndType<[16], [I32]>:$result);
+
+   let extraClassDeclaration = [{
+
+  AMXTileType getTileType() {
+    return ::llvm::cast<AMXTileType>(getTile().getType());
+  }
+
+   std::string getIntrinsicName() {
+       std::string intr = "llvm.x86.tilemovrow.internal";
+    return intr;
+  }
+
+  }];
+
+  let assemblyFormat = [{
+    $rows `,` $colsb `,`
+    $tile `,` $rowIndex
+    attr-dict `:`
+    functional-type(operands, results)
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// ACE Op definitions
+//===----------------------------------------------------------------------===//
+
+class ACE_Op<string mnemonic, list<Trait> traits = []>
+    : Op<X86_Dialect, "ace." # mnemonic, traits> {
+  let cppNamespace = X86_Dialect.cppNamespace # "::ace";
+}
+
+def BSRInitOp : ACE_Op<"bsr_init", [
+    X86IntrinsicOpInterface,
+    MemoryEffects<[MemWrite]>
+  ]> {
+  let summary = "Initialize Block Scale Register";
+  let description = [{
+    Initializes the implicit Block Scale Register (BSR0).
+
+    The operation is eventually lowered into the LLVM intrinsic
+    `llvm.x86.bsrinit`, which is selected to the `BSRINIT`
+    machine instruction.
+
+    Example:
+
+    ```mlir
+      x86.bsr_init
+    ```
+  }];
+
+  let arguments = (ins);
+  let results = (outs);
+
+  let extraClassDeclaration = [{
+    std::string getIntrinsicName() {
+      return "llvm.x86.bsrinit";
+    }
+
+    SmallVector<Value> getIntrinsicOperands(
+        ::mlir::ArrayRef<Value> operands,
+        const ::mlir::LLVMTypeConverter &typeConverter,
+        ::mlir::RewriterBase &rewriter) {
+      return {};
+    }
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// ACE Tile Multiply
+//===----------------------------------------------------------------------===//
+
+def TileMulFOutProdOp : ACE_Op<"tile_mulf", [Pure,
+    X86IntrinsicOpInterface,
+    AllTypesMatch<["lhs", "rhs"]>,
+    AllTypesMatch<["acc", "res"]>
+  ]> {
+  let summary = "BF16 tile outer-product multiplication operation";
+  let description = [{
+          Computes the outer-product of two BF16 vectors and accumulates the
+          result into an F32 AMX tile accumulator.
+
+          The operation accepts two 32-element BF16 vectors (`lhs` and `rhs`) and
+          an F32 AMX tile accumulator (`acc`). It produces an updated F32 AMX tile
+          containing the accumulated outer-product result.
+
+          Example:
+
+          ```mlir
+            %0 = x86.ace.tile_mulf %lhs, %rhs, %acc
+              : vector<32xbf16>, vector<32xbf16>, !x86.amx.tile<16x16xf32>
+          ```          
+  }];
+
+  let arguments = (ins VectorOfLengthAndType<[32], [BF16]>:$lhs,
+                       VectorOfLengthAndType<[32], [BF16]>:$rhs,
+                       AMXTileF32:$acc);
+  let results = (outs AMXTileF32:$res);
+  let extraClassDeclaration = [{
+
+   AMXTileType getAccTileType() {
+      return ::llvm::cast<AMXTileType>(getAcc().getType());
+    }
+
+    std::string getIntrinsicName() {
+      std::string intr = "llvm.x86.top2bf16ps.internal";
+
+      return intr;
+    }
+
+    SmallVector<Value> getIntrinsicOperands(
+        ::mlir::ArrayRef<Value> operands,
+        const ::mlir::LLVMTypeConverter &typeConverter,
+        ::mlir::RewriterBase &rewriter);
+
+  }];
+  let assemblyFormat = "$lhs `,` $rhs `,` $acc attr-dict `:` "
+                       "qualified(type($lhs)) `,` qualified(type($rhs))"
+                       " `,` qualified(type($acc)) ";
+  let hasVerifier = 1;
+}
+
+def TileMulIOutProdOp : ACE_Op<"tile_muli", [Pure,
+    X86IntrinsicOpInterface,
+    AllTypesMatch<["lhs", "rhs"]>,
+    AllTypesMatch<["acc", "res"]>
+  ]> {
+  let summary = "tile outer-product multiplication operation (integer)";
+  let description = [{
+
+           Computes the outer-product of two INT8 vectors and accumulates the
+           result into an I32 AMX tile accumulator.
+
+           The operation accepts two 32-element INT8 vectors (`lhs` and `rhs`) and
+           an I32 AMX tile accumulator (`acc`). It produces an updated I32 AMX tile
+           containing the accumulated outer-product result
+
+          Example:
+
+          ```mlir
+            %0 = x86.ace.tile_muli %lhs, %rhs, %acc
+              : vector<64xi8>, vector<64xi8>, !x86.amx.tile<16x16xi32>
+          ```
+  }];
+  let arguments = (ins VectorOfLengthAndType<[64], [I8]>:$lhs,
+                       VectorOfLengthAndType<[64], [I8]>:$rhs,
+                       AMXTileI32:$acc,
+                       UnitAttr:$isZextLhs,
+                       UnitAttr:$isZextRhs
+                       );
+  let results = (outs AMXTileI32:$res);
+  let extraClassDeclaration = [{
+
+   AMXTileType getAccTileType() {
+      return ::llvm::cast<AMXTileType>(getAcc().getType());
+    }
+
+    std::string getIntrinsicName() {
+      std::string intr = "llvm.x86.top4b";
+      intr += getIsZextLhs() ? "u" : "s";
+      intr += getIsZextRhs() ? "u" : "s";
+      intr += "d.internal";
+      return intr;
+    }
+    SmallVector<Value> getIntrinsicOperands(
+        ::mlir::ArrayRef<Value> operands,
+        const ::mlir::LLVMTypeConverter &typeConverter,
+        ::mlir::RewriterBase &rewriter);
+  }];
+  let assemblyFormat = "$lhs (`zext` $isZextLhs^)? `,` $rhs (`zext` $isZextRhs^)? `,` $acc attr-dict `:` "
+                       "qualified(type($lhs)) `,` qualified(type($rhs)) `,` qualified(type($acc)) ";
   let hasVerifier = 1;
 }
 
