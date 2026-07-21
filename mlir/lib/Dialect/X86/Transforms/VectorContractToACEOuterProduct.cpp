@@ -1,4 +1,4 @@
-//===- VectorContractToACEOuterProduct.cpp ----------------------------------===//
+//===- VectorContractToACEOuterProduct.cpp---------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -114,7 +114,7 @@ static LogicalResult validateContractOps(OpBuilder &rewriter,
                                          vector::ContractionOp contractOp,
                                          unsigned int blockingFactor,
                                          Value srcBuffLhs, Value srcBuffRhs,
-                                         bool srcValidate) {
+                                         bool srcValidate, Type ipType) {
 
   if (srcValidate) {
     // Get the MemRef buffer of LHS operand.
@@ -163,11 +163,14 @@ static LogicalResult validateContractOps(OpBuilder &rewriter,
   llvm::copy_if(lhsShape, std::back_inserter(nonUnitDimLhs),
                 [](int64_t dim) { return (dim != 16 && dim != 1); });
 
-  /* if (nonUnitDimLhs.size() != 1)
+  if (ipType.isBF16() && nonUnitDimLhs.size() != 1)
     return failure();
 
-  if (nonUnitDimLhs[0] != blockingFactor)
-    return failure(); */
+  if (ipType.isBF16() && nonUnitDimLhs[0] != blockingFactor)
+    return failure();
+
+  if (ipType.isSignlessInteger(8) && nonUnitDimLhs.size() != 0)
+    return failure();
 
   // The RHS dims should be 16 or vnni or 1. Like <1x16x16x2> or
   // <16x16x4>. The vnni dims should be 2 or 4.
@@ -177,11 +180,14 @@ static LogicalResult validateContractOps(OpBuilder &rewriter,
   llvm::copy_if(rhsShape, std::back_inserter(nonUnitDimRhs),
                 [](int64_t dim) { return (dim != 16 && dim != 1); });
 
-  /* if (nonUnitDimRhs.size() != 1)
+  if (ipType.isBF16() && nonUnitDimRhs.size() != 1)
     return failure();
 
-  if (nonUnitDimRhs[0] != (blockingFactor))
-    return failure(); */
+  if (ipType.isBF16() && nonUnitDimRhs[0] != (blockingFactor))
+    return failure();
+
+  if (ipType.isSignlessInteger(8) && nonUnitDimRhs.size() != 0)
+    return failure();
 
   return success();
 }
@@ -214,8 +220,7 @@ static SmallVector<Value> createTileZeros(OpBuilder &rewriter, Location loc,
                                           Type opType, scf::ForOp loop,
                                           int64_t size) {
   rewriter.setInsertionPoint(loop);
-
-  ace::BSRInitOp::create(rewriter, loc);
+  // ace::BSRInitOp::create(rewriter, loc);
 
   SmallVector<Value> loopItrArgs;
   auto zeroTileType = amx::TileType::get({16, 16}, opType);
@@ -251,36 +256,24 @@ static SmallVector<Value> loadMasks(OpBuilder &rewriter, Location loc,
   return mask;
 }
 
-static Value loadShuffleSelect(OpBuilder &rewriter,
-                               Location loc,
-                               Value currentVec,
-                               Value cmp,
-                               Value memref,
-                               SmallVector<Value> &loadOffsets,
-                               Value c1,
-                               VectorType vecTy,
-                               VectorType vecTy4) {
-  // Advance the row offset.
+// Function to load the next row vector by incrementing the row offset, shuffles
+// it into the target vector layout, and conditionally selects it based on
+// the given comparison mask.
+static Value loadShuffleSelect(OpBuilder &rewriter, Location loc,
+                               Value currentVec, Value cmp, Value memref,
+                               SmallVector<Value> &loadOffsets, Value c1,
+                               VectorType vecTy, VectorType vecTy4) {
   int rowIdx = loadOffsets.size() - 2;
   loadOffsets[rowIdx] =
       arith::AddIOp::create(rewriter, loc, loadOffsets[rowIdx], c1);
 
-  // Load <4xi32>.
-  Value v = vector::LoadOp::create(
-      rewriter, loc, vecTy4, memref, loadOffsets);
+  Value v = vector::LoadOp::create(rewriter, loc, vecTy4, memref, loadOffsets);
 
-  // Broadcast it to <16xi32>.
   Value shuffled = vector::ShuffleOp::create(
       rewriter, loc, vecTy, v, v,
-      ArrayRef<int64_t>{
-          0, 1, 2, 3,
-          0, 1, 2, 3,
-          0, 1, 2, 3,
-          0, 1, 2, 3});
+      ArrayRef<int64_t>{0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3});
 
-  // Select between the original and replacement.
-  return arith::SelectOp::create(
-      rewriter, loc, cmp, shuffled, currentVec);
+  return arith::SelectOp::create(rewriter, loc, cmp, shuffled, currentVec);
 }
 
 static SmallVector<Value>
@@ -350,26 +343,25 @@ transposeShuffle(OpBuilder &rewriter, Location loc, Value matrix, Type ipType,
     Value v3 = vector::LoadOp::create(rewriter, loc, vecTy,
                                       castOpFinal.getResult(0), loadOffsets);
 
-SmallVector<Value> vecs = {v0, v1, v2, v3};
+    SmallVector<Value> vecs = {v0, v1, v2, v3};
 
-SmallVector<Value> masks = {mask1, mask2, mask3};
+    SmallVector<Value> masks = {mask1, mask2, mask3};
 
-for (Value mask : masks) {
-  Value cmp = arith::CmpIOp::create(
-      rewriter, loc, arith::CmpIPredicate::eq, mask, cst_one);
+    for (Value mask : masks) {
+      Value cmp = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq,
+                                        mask, cst_one);
 
-  for (Value &vec : vecs) {
-    vec = loadShuffleSelect(
-        rewriter, loc, vec, cmp,
-        castOpFinal.getResult(0),
-        loadOffsets, c1, vecTy, vecTy_4);
-  }
-}
+      for (Value &vec : vecs) {
+        vec =
+            loadShuffleSelect(rewriter, loc, vec, cmp, castOpFinal.getResult(0),
+                              loadOffsets, c1, vecTy, vecTy_4);
+      }
+    }
 
-v0 = vecs[0];
-v1 = vecs[1];
-v2 = vecs[2];
-v3 = vecs[3];
+    v0 = vecs[0];
+    v1 = vecs[1];
+    v2 = vecs[2];
+    v3 = vecs[3];
 
     Value s4;
     Value s5;
@@ -389,7 +381,6 @@ v3 = vecs[3];
     v3 = vector::BitCastOp::create(rewriter, loc,
                                    VectorType::get({elemNumber}, ipType), v3);
     if (ipType.isBF16()) {
-      // Shuffle part1:
       auto s0 = vector::ShuffleOp::create(
           rewriter, loc, VectorType::get({32}, ipType), v0, v1,
           ArrayRef<int64_t>{0,  1,  32, 33, 2,  3,  34, 35, 8,  9,  40,
@@ -519,9 +510,29 @@ v3 = vecs[3];
   return transposedValue;
 }
 
+/// Helper to generate a strided prefetch. Updates the selected index in
+/// `loadOffsets`, emits `memref.prefetch`, and restores the original offset.
+static void createStridedPrefetch(bool isStrided, bool leastOffset,
+                                  int64_t offset, int64_t preOffset,
+                                  Value restoreOffset, OpBuilder &rewriter,
+                                  Location loc, Value matrix,
+                                  SmallVectorImpl<Value> &loadOffsets) {
+  if (!isStrided)
+    return;
+
+  size_t dim = leastOffset ? loadOffsets.size() - 1 : loadOffsets.size() - 2;
+  Value pOffset =
+      arith::ConstantIndexOp::create(rewriter, loc, preOffset + offset);
+  loadOffsets[dim] = pOffset;
+  memref::PrefetchOp::create(rewriter, loc, matrix, loadOffsets, false, 3,
+                             true);
+  loadOffsets[dim] = restoreOffset;
+}
+
 static SmallVector<Value> vnniShuffle(OpBuilder &rewriter, Location loc,
                                       Value matrix, Type ipType, Type opType,
-                                      int64_t upperBound, int64_t offsetA) {
+                                      int64_t upperBound, int64_t offsetA,
+                                      int group) {
 
   Operation *defOp = matrix.getDefiningOp();
   auto subview = dyn_cast<memref::SubViewOp>(defOp);
@@ -543,7 +554,7 @@ static SmallVector<Value> vnniShuffle(OpBuilder &rewriter, Location loc,
   Value offset_2 = arith::ConstantIndexOp::create(rewriter, loc, (offsetA + 2));
   Value offset_3 = arith::ConstantIndexOp::create(rewriter, loc, (offsetA + 3));
 
-  /*bool isStrided = true;
+  bool isStrided = true;
   auto subviewTy = llvm::cast<mlir::MemRefType>(matrix.getType());
   int64_t offset;
   SmallVector<int64_t> strides;
@@ -563,7 +574,7 @@ static SmallVector<Value> vnniShuffle(OpBuilder &rewriter, Location loc,
       leastOffset = true;
       preOffset = 4096;
     }
-  }*/
+  }
 
   for (int i = 0; i < upperBound; i = i + loopStep) {
     Value offset_i = arith::ConstantIndexOp::create(rewriter, loc, i);
@@ -573,51 +584,17 @@ static SmallVector<Value> vnniShuffle(OpBuilder &rewriter, Location loc,
     Value v0 = vector::LoadOp::create(rewriter, loc,
                                       VectorType::get({loopStep}, ipType),
                                       matrix, loadOffsets);
-
-    /*if (isStrided) {
-
-      if (leastOffset) {
-        Value pOffset =
-            arith::ConstantIndexOp::create(rewriter, loc, preOffset + i);
-        loadOffsets[loadOffsets.size() - 1] = pOffset;
-        memref::PrefetchOp::create(rewriter, loc, matrix, loadOffsets, false, 3,
-                                   true);
-        loadOffsets[loadOffsets.size() - 1] = offset_i;
-
-      } else {
-        Value pOffset =
-            arith::ConstantIndexOp::create(rewriter, loc, preOffset + offsetA);
-        loadOffsets[loadOffsets.size() - 2] = pOffset;
-        memref::PrefetchOp::create(rewriter, loc, matrix, loadOffsets, false, 3,
-                                   true);
-        loadOffsets[loadOffsets.size() - 2] = offset_0;
-      }
-    }*/
+    createStridedPrefetch(isStrided, leastOffset, leastOffset ? i : offsetA,
+                          preOffset, leastOffset ? offset_i : offset_0,
+                          rewriter, loc, matrix, loadOffsets);
 
     loadOffsets[loadOffsets.size() - 2] = offset_1;
     Value v1 = vector::LoadOp::create(rewriter, loc,
                                       VectorType::get({loopStep}, ipType),
                                       matrix, loadOffsets);
-
-    /*if (isStrided) {
-
-      if (leastOffset) {
-        Value pOffset =
-            arith::ConstantIndexOp::create(rewriter, loc, preOffset + i);
-        loadOffsets[loadOffsets.size() - 1] = pOffset;
-        memref::PrefetchOp::create(rewriter, loc, matrix, loadOffsets, false, 3,
-                                   true);
-        loadOffsets[loadOffsets.size() - 1] = offset_i;
-
-      } else {
-        Value pOffset = arith::ConstantIndexOp::create(rewriter, loc,
-                                                       preOffset + offsetA + 1);
-        loadOffsets[loadOffsets.size() - 2] = pOffset;
-        memref::PrefetchOp::create(rewriter, loc, matrix, loadOffsets, false, 3,
-                                   true);
-        loadOffsets[loadOffsets.size() - 2] = offset_1;
-      }
-    } */
+    createStridedPrefetch(isStrided, leastOffset, leastOffset ? i : offsetA + 1,
+                          preOffset, leastOffset ? offset_i : offset_1,
+                          rewriter, loc, matrix, loadOffsets);
 
     Value s0;
     Value s1;
@@ -641,81 +618,163 @@ static SmallVector<Value> vnniShuffle(OpBuilder &rewriter, Location loc,
       Value v2 = vector::LoadOp::create(rewriter, loc,
                                         VectorType::get({loopStep}, ipType),
                                         matrix, loadOffsets);
+      createStridedPrefetch(isStrided, leastOffset,
+                            leastOffset ? i : offsetA + 2, preOffset,
+                            leastOffset ? offset_i : offset_2, rewriter, loc,
+                            matrix, loadOffsets);
 
       loadOffsets[loadOffsets.size() - 2] = offset_3;
       Value v3 = vector::LoadOp::create(rewriter, loc,
                                         VectorType::get({loopStep}, ipType),
                                         matrix, loadOffsets);
+      createStridedPrefetch(isStrided, leastOffset,
+                            leastOffset ? i : offsetA + 3, preOffset,
+                            leastOffset ? offset_i : offset_3, rewriter, loc,
+                            matrix, loadOffsets);
 
-      auto a0 = vector::ShuffleOp::create(
-          rewriter, loc, VectorType::get({64}, ipType), v0, v1,
-          ArrayRef<int64_t>{
-              0,  64,  1,   65,  2,   66,  3,   67,  4,   68,  5,   69, 6,
-              70, 7,   71,  16,  80,  17,  81,  18,  82,  19,  83,  20, 84,
-              21, 85,  22,  86,  23,  87,  32,  96,  33,  97,  34,  98, 35,
-              99, 36,  100, 37,  101, 38,  102, 39,  103, 48,  112, 49, 113,
-              50, 114, 51,  115, 52,  116, 53,  117, 54,  118, 55,  119});
+      if (group == 4) {
+        auto a0 = vector::ShuffleOp::create(
+            rewriter, loc, VectorType::get({64}, ipType), v0, v2,
+            ArrayRef<int64_t>{0,  64, 1,  65, 2,  66, 3,  67, 4,  68, 5,
+                              69, 6,  70, 7,  71, 8,  72, 9,  73, 10, 74,
+                              11, 75, 12, 76, 13, 77, 14, 78, 15, 79, 16,
+                              80, 17, 81, 18, 82, 19, 83, 20, 84, 21, 85,
+                              22, 86, 23, 87, 24, 88, 25, 89, 26, 90, 27,
+                              91, 28, 92, 29, 93, 30, 94, 31, 95});
 
-      auto a1 = vector::ShuffleOp::create(
-          rewriter, loc, VectorType::get({64}, ipType), v0, v1,
-          ArrayRef<int64_t>{
-              8,   72,  9,   73,  10,  74,  11,  75,  12,  76,  13,  77,  14,
-              78,  15,  79,  24,  88,  25,  89,  26,  90,  27,  91,  28,  92,
-              29,  93,  30,  94,  31,  95,  40,  104, 41,  105, 42,  106, 43,
-              107, 44,  108, 45,  109, 46,  110, 47,  111, 56,  120, 57,  121,
-              58,  122, 59,  123, 60,  124, 61,  125, 62,  126, 63,  127});
+        auto a1 = vector::ShuffleOp::create(
+            rewriter, loc, VectorType::get({64}, ipType), v0, v2,
+            ArrayRef<int64_t>{
+                32,  96,  33,  97,  34,  98,  35,  99,  36,  100, 37,  101, 38,
+                102, 39,  103, 40,  104, 41,  105, 42,  106, 43,  107, 44,  108,
+                45,  109, 46,  110, 47,  111, 48,  112, 49,  113, 50,  114, 51,
+                115, 52,  116, 53,  117, 54,  118, 55,  119, 56,  120, 57,  121,
+                58,  122, 59,  123, 60,  124, 61,  125, 62,  126, 63,  127});
 
-      auto a2 = vector::ShuffleOp::create(
-          rewriter, loc, VectorType::get({64}, ipType), v2, v3,
-          ArrayRef<int64_t>{
-              0,  64,  1,   65,  2,   66,  3,   67,  4,   68,  5,   69, 6,
-              70, 7,   71,  16,  80,  17,  81,  18,  82,  19,  83,  20, 84,
-              21, 85,  22,  86,  23,  87,  32,  96,  33,  97,  34,  98, 35,
-              99, 36,  100, 37,  101, 38,  102, 39,  103, 48,  112, 49, 113,
-              50, 114, 51,  115, 52,  116, 53,  117, 54,  118, 55,  119});
+        auto a2 = vector::ShuffleOp::create(
+            rewriter, loc, VectorType::get({64}, ipType), v1, v3,
+            ArrayRef<int64_t>{0,  64, 1,  65, 2,  66, 3,  67, 4,  68, 5,
+                              69, 6,  70, 7,  71, 8,  72, 9,  73, 10, 74,
+                              11, 75, 12, 76, 13, 77, 14, 78, 15, 79, 16,
+                              80, 17, 81, 18, 82, 19, 83, 20, 84, 21, 85,
+                              22, 86, 23, 87, 24, 88, 25, 89, 26, 90, 27,
+                              91, 28, 92, 29, 93, 30, 94, 31, 95});
 
-      auto a3 = vector::ShuffleOp::create(
-          rewriter, loc, VectorType::get({64}, ipType), v2, v3,
-          ArrayRef<int64_t>{
-              8,   72,  9,   73,  10,  74,  11,  75,  12,  76,  13,  77,  14,
-              78,  15,  79,  24,  88,  25,  89,  26,  90,  27,  91,  28,  92,
-              29,  93,  30,  94,  31,  95,  40,  104, 41,  105, 42,  106, 43,
-              107, 44,  108, 45,  109, 46,  110, 47,  111, 56,  120, 57,  121,
-              58,  122, 59,  123, 60,  124, 61,  125, 62,  126, 63,  127});
+        auto a3 = vector::ShuffleOp::create(
+            rewriter, loc, VectorType::get({64}, ipType), v1, v3,
+            ArrayRef<int64_t>{
+                32,  96,  33,  97,  34,  98,  35,  99,  36,  100, 37,  101, 38,
+                102, 39,  103, 40,  104, 41,  105, 42,  106, 43,  107, 44,  108,
+                45,  109, 46,  110, 47,  111, 48,  112, 49,  113, 50,  114, 51,
+                115, 52,  116, 53,  117, 54,  118, 55,  119, 56,  120, 57,  121,
+                58,  122, 59,  123, 60,  124, 61,  125, 62,  126, 63,  127});
 
-      s0 = vector::ShuffleOp::create(
-          rewriter, loc, VectorType::get({64}, ipType), a0, a2,
-          ArrayRef<int64_t>{0,   1,  64,  65,  2,   3,  66,  67,  4,  5,   68,
-                            69,  6,  7,   70,  71,  16, 17,  80,  81, 18,  19,
-                            82,  83, 20,  21,  84,  85, 22,  23,  86, 87,  32,
-                            33,  96, 97,  34,  35,  98, 99,  36,  37, 100, 101,
-                            38,  39, 102, 103, 48,  49, 112, 113, 50, 51,  114,
-                            115, 52, 53,  116, 117, 54, 55,  118, 119});
-      s1 = vector::ShuffleOp::create(
-          rewriter, loc, VectorType::get({64}, ipType), a0, a2,
-          ArrayRef<int64_t>{
-              8,   9,  72,  73,  10,  11, 74,  75,  12,  13,  76,  77,  14,
-              15,  78, 79,  24,  25,  88, 89,  26,  27,  90,  91,  28,  29,
-              92,  93, 30,  31,  94,  95, 40,  41,  104, 105, 42,  43,  106,
-              107, 44, 45,  108, 109, 46, 47,  110, 111, 56,  57,  120, 121,
-              58,  59, 122, 123, 60,  61, 124, 125, 62,  63,  126, 127});
+        s0 = vector::ShuffleOp::create(
+            rewriter, loc, VectorType::get({64}, ipType), a0, a2,
+            ArrayRef<int64_t>{0,  1,  64, 65, 2,  3,  66, 67, 4,  5,  68,
+                              69, 6,  7,  70, 71, 8,  9,  72, 73, 10, 11,
+                              74, 75, 12, 13, 76, 77, 14, 15, 78, 79, 16,
+                              17, 80, 81, 18, 19, 82, 83, 20, 21, 84, 85,
+                              22, 23, 86, 87, 24, 25, 88, 89, 26, 27, 90,
+                              91, 28, 29, 92, 93, 30, 31, 94, 95});
 
-      s2 = vector::ShuffleOp::create(
-          rewriter, loc, VectorType::get({64}, ipType), a1, a3,
-          ArrayRef<int64_t>{0,   1,  64,  65,  2,   3,  66,  67,  4,  5,   68,
-                            69,  6,  7,   70,  71,  16, 17,  80,  81, 18,  19,
-                            82,  83, 20,  21,  84,  85, 22,  23,  86, 87,  32,
-                            33,  96, 97,  34,  35,  98, 99,  36,  37, 100, 101,
-                            38,  39, 102, 103, 48,  49, 112, 113, 50, 51,  114,
-                            115, 52, 53,  116, 117, 54, 55,  118, 119});
-      s3 = vector::ShuffleOp::create(
-          rewriter, loc, VectorType::get({64}, ipType), a1, a3,
-          ArrayRef<int64_t>{
-              8,   9,  72,  73,  10,  11, 74,  75,  12,  13,  76,  77,  14,
-              15,  78, 79,  24,  25,  88, 89,  26,  27,  90,  91,  28,  29,
-              92,  93, 30,  31,  94,  95, 40,  41,  104, 105, 42,  43,  106,
-              107, 44, 45,  108, 109, 46, 47,  110, 111, 56,  57,  120, 121,
-              58,  59, 122, 123, 60,  61, 124, 125, 62,  63,  126, 127});
+        s1 = vector::ShuffleOp::create(
+            rewriter, loc, VectorType::get({64}, ipType), a0, a2,
+            ArrayRef<int64_t>{
+                32,  33,  96,  97,  34,  35,  98,  99,  36,  37,  100, 101, 38,
+                39,  102, 103, 40,  41,  104, 105, 42,  43,  106, 107, 44,  45,
+                108, 109, 46,  47,  110, 111, 48,  49,  112, 113, 50,  51,  114,
+                115, 52,  53,  116, 117, 54,  55,  118, 119, 56,  57,  120, 121,
+                58,  59,  122, 123, 60,  61,  124, 125, 62,  63,  126, 127});
+
+        s2 = vector::ShuffleOp::create(
+            rewriter, loc, VectorType::get({64}, ipType), a1, a3,
+            ArrayRef<int64_t>{0,  1,  64, 65, 2,  3,  66, 67, 4,  5,  68,
+                              69, 6,  7,  70, 71, 8,  9,  72, 73, 10, 11,
+                              74, 75, 12, 13, 76, 77, 14, 15, 78, 79, 16,
+                              17, 80, 81, 18, 19, 82, 83, 20, 21, 84, 85,
+                              22, 23, 86, 87, 24, 25, 88, 89, 26, 27, 90,
+                              91, 28, 29, 92, 93, 30, 31, 94, 95});
+
+        s3 = vector::ShuffleOp::create(
+            rewriter, loc, VectorType::get({64}, ipType), a1, a3,
+            ArrayRef<int64_t>{
+                32,  33,  96,  97,  34,  35,  98,  99,  36,  37,  100, 101, 38,
+                39,  102, 103, 40,  41,  104, 105, 42,  43,  106, 107, 44,  45,
+                108, 109, 46,  47,  110, 111, 48,  49,  112, 113, 50,  51,  114,
+                115, 52,  53,  116, 117, 54,  55,  118, 119, 56,  57,  120, 121,
+                58,  59,  122, 123, 60,  61,  124, 125, 62,  63,  126, 127});
+      } else {
+        auto a0 = vector::ShuffleOp::create(
+            rewriter, loc, VectorType::get({64}, ipType), v0, v1,
+            ArrayRef<int64_t>{
+                0,  64,  1,   65,  2,   66,  3,   67,  4,   68,  5,   69, 6,
+                70, 7,   71,  16,  80,  17,  81,  18,  82,  19,  83,  20, 84,
+                21, 85,  22,  86,  23,  87,  32,  96,  33,  97,  34,  98, 35,
+                99, 36,  100, 37,  101, 38,  102, 39,  103, 48,  112, 49, 113,
+                50, 114, 51,  115, 52,  116, 53,  117, 54,  118, 55,  119});
+
+        auto a1 = vector::ShuffleOp::create(
+            rewriter, loc, VectorType::get({64}, ipType), v0, v1,
+            ArrayRef<int64_t>{
+                8,   72,  9,   73,  10,  74,  11,  75,  12,  76,  13,  77,  14,
+                78,  15,  79,  24,  88,  25,  89,  26,  90,  27,  91,  28,  92,
+                29,  93,  30,  94,  31,  95,  40,  104, 41,  105, 42,  106, 43,
+                107, 44,  108, 45,  109, 46,  110, 47,  111, 56,  120, 57,  121,
+                58,  122, 59,  123, 60,  124, 61,  125, 62,  126, 63,  127});
+
+        auto a2 = vector::ShuffleOp::create(
+            rewriter, loc, VectorType::get({64}, ipType), v2, v3,
+            ArrayRef<int64_t>{
+                0,  64,  1,   65,  2,   66,  3,   67,  4,   68,  5,   69, 6,
+                70, 7,   71,  16,  80,  17,  81,  18,  82,  19,  83,  20, 84,
+                21, 85,  22,  86,  23,  87,  32,  96,  33,  97,  34,  98, 35,
+                99, 36,  100, 37,  101, 38,  102, 39,  103, 48,  112, 49, 113,
+                50, 114, 51,  115, 52,  116, 53,  117, 54,  118, 55,  119});
+
+        auto a3 = vector::ShuffleOp::create(
+            rewriter, loc, VectorType::get({64}, ipType), v2, v3,
+            ArrayRef<int64_t>{
+                8,   72,  9,   73,  10,  74,  11,  75,  12,  76,  13,  77,  14,
+                78,  15,  79,  24,  88,  25,  89,  26,  90,  27,  91,  28,  92,
+                29,  93,  30,  94,  31,  95,  40,  104, 41,  105, 42,  106, 43,
+                107, 44,  108, 45,  109, 46,  110, 47,  111, 56,  120, 57,  121,
+                58,  122, 59,  123, 60,  124, 61,  125, 62,  126, 63,  127});
+
+        s0 = vector::ShuffleOp::create(
+            rewriter, loc, VectorType::get({64}, ipType), a0, a2,
+            ArrayRef<int64_t>{
+                0,  1,  64,  65,  2,   3,  66,  67,  4,   5,  68,  69,  6,
+                7,  70, 71,  16,  17,  80, 81,  18,  19,  82, 83,  20,  21,
+                84, 85, 22,  23,  86,  87, 32,  33,  96,  97, 34,  35,  98,
+                99, 36, 37,  100, 101, 38, 39,  102, 103, 48, 49,  112, 113,
+                50, 51, 114, 115, 52,  53, 116, 117, 54,  55, 118, 119});
+        s1 = vector::ShuffleOp::create(
+            rewriter, loc, VectorType::get({64}, ipType), a0, a2,
+            ArrayRef<int64_t>{
+                8,   9,  72,  73,  10,  11, 74,  75,  12,  13,  76,  77,  14,
+                15,  78, 79,  24,  25,  88, 89,  26,  27,  90,  91,  28,  29,
+                92,  93, 30,  31,  94,  95, 40,  41,  104, 105, 42,  43,  106,
+                107, 44, 45,  108, 109, 46, 47,  110, 111, 56,  57,  120, 121,
+                58,  59, 122, 123, 60,  61, 124, 125, 62,  63,  126, 127});
+
+        s2 = vector::ShuffleOp::create(
+            rewriter, loc, VectorType::get({64}, ipType), a1, a3,
+            ArrayRef<int64_t>{
+                0,  1,  64,  65,  2,   3,  66,  67,  4,   5,  68,  69,  6,
+                7,  70, 71,  16,  17,  80, 81,  18,  19,  82, 83,  20,  21,
+                84, 85, 22,  23,  86,  87, 32,  33,  96,  97, 34,  35,  98,
+                99, 36, 37,  100, 101, 38, 39,  102, 103, 48, 49,  112, 113,
+                50, 51, 114, 115, 52,  53, 116, 117, 54,  55, 118, 119});
+        s3 = vector::ShuffleOp::create(
+            rewriter, loc, VectorType::get({64}, ipType), a1, a3,
+            ArrayRef<int64_t>{
+                8,   9,  72,  73,  10,  11, 74,  75,  12,  13,  76,  77,  14,
+                15,  78, 79,  24,  25,  88, 89,  26,  27,  90,  91,  28,  29,
+                92,  93, 30,  31,  94,  95, 40,  41,  104, 105, 42,  43,  106,
+                107, 44, 45,  108, 109, 46, 47,  110, 111, 56,  57,  120, 121,
+                58,  59, 122, 123, 60,  61, 124, 125, 62,  63,  126, 127});
+      }
     }
 
     shuffledValue.push_back(s0);
@@ -730,13 +789,13 @@ static SmallVector<Value> vnniShuffle(OpBuilder &rewriter, Location loc,
   return shuffledValue;
 }
 
+/// Loads vectors from the input memref along the row dimension in fixed-size
+/// chunks and returns the loaded vectors as a collection.
 static SmallVector<Value> loadData(OpBuilder &rewriter, Location loc,
                                    Value matrix, Type ipType, Type opType,
                                    int64_t upperBound) {
   SmallVector<Value> matrixValue;
-
   auto memrefType = llvm::cast<MemRefType>(matrix.getType());
-
   Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
   SmallVector<Value> loadOffsets(memrefType.getShape().size(), c0);
 
@@ -754,19 +813,14 @@ static SmallVector<Value> loadData(OpBuilder &rewriter, Location loc,
   return matrixValue;
 }
 
-static Value createTileMulOutProdOp(OpBuilder &rewriter,
-                                    Location loc,
-                                    Type ipType,
-                                    Value lhs,
-                                    Value rhs,
+static Value createTileMulOutProdOp(OpBuilder &rewriter, Location loc,
+                                    Type ipType, Value lhs, Value rhs,
                                     Value acc) {
   if (ipType.isBF16())
-    return ace::TileMulFOutProdOp::create(
-        rewriter, loc, lhs, rhs, acc);
+    return ace::TileMulFOutProdOp::create(rewriter, loc, lhs, rhs, acc);
 
   if (ipType.isSignlessInteger(8))
-    return ace::TileMulIOutProdOp::create(
-        rewriter, loc, lhs, rhs, acc);
+    return ace::TileMulIOutProdOp::create(rewriter, loc, lhs, rhs, acc);
 
   llvm_unreachable("Unsupported input type");
 }
@@ -832,19 +886,19 @@ createLoops(OpBuilder &rewriter, Location loc, Value lowerBound,
 
         SmallVector<Value> ops;
 
+        // Case 1: A(VNNI^T) x B(VNNI).
         if (group == 1) {
-          SmallVector<Value> matAValue =
-              loadData(rewriter, loc, lhsClone->getResult(0), ipType, opType, 32);
+          SmallVector<Value> matAValue = loadData(
+              rewriter, loc, lhsClone->getResult(0), ipType, opType, 32);
 
           SmallVector<Value> matBValue =
               loadData(rewriter, loc, matB, ipType, opType, 64);
 
           for (int i = 0, k = 0; i < 2; i++) {
             for (int j = 0; j < 4; j++) {
-              Value op = createTileMulOutProdOp(
-                  rewriter, loc, ipType,
-                  matAValue[i], matBValue[j],
-                  iterArgsNewInnerLoop[k]);
+              Value op =
+                  createTileMulOutProdOp(rewriter, loc, ipType, matAValue[i],
+                                         matBValue[j], iterArgsNewInnerLoop[k]);
 
               k++;
               ops.push_back(op);
@@ -852,22 +906,22 @@ createLoops(OpBuilder &rewriter, Location loc, Value lowerBound,
           }
         }
 
+        // Case 3: A(flat) x B(flat).
         if (group == 3) {
 
           SmallVector<Value> ops0;
 
           SmallVector<Value> matAValue =
               transposeShuffle(rewriter, loc, lhsClone->getResult(0), ipType,
-                              opType, mask1, mask2, mask3, 32, blockingFactor);
+                               opType, mask1, mask2, mask3, 32, blockingFactor);
           SmallVector<Value> matBValue =
-              vnniShuffle(rewriter, loc, matB, ipType, opType, 64, 0);
+              vnniShuffle(rewriter, loc, matB, ipType, opType, 64, 0, group);
 
           for (int i = 0, k = 0; i < 8; i += 4) {
             for (int j = 0; j < 4; j++) {
-              Value op = createTileMulOutProdOp(
-                  rewriter, loc, ipType,
-                  matAValue[i], matBValue[j],
-                  iterArgsNewInnerLoop[k]);
+              Value op =
+                  createTileMulOutProdOp(rewriter, loc, ipType, matAValue[i],
+                                         matBValue[j], iterArgsNewInnerLoop[k]);
 
               k++;
               ops0.push_back(op);
@@ -875,14 +929,13 @@ createLoops(OpBuilder &rewriter, Location loc, Value lowerBound,
           }
 
           SmallVector<Value> ops1;
-          matBValue = vnniShuffle(rewriter, loc, matB, ipType, opType, 64, 2);
+          matBValue =
+              vnniShuffle(rewriter, loc, matB, ipType, opType, 64, 2, group);
 
           for (int i = 1, k = 0; i < 8; i += 4) {
             for (int j = 0; j < 4; j++) {
               Value op = createTileMulOutProdOp(
-                  rewriter, loc, ipType,
-                  matAValue[i], matBValue[j],
-                  ops0[k]);
+                  rewriter, loc, ipType, matAValue[i], matBValue[j], ops0[k]);
 
               k++;
               ops1.push_back(op);
@@ -890,28 +943,26 @@ createLoops(OpBuilder &rewriter, Location loc, Value lowerBound,
           }
 
           SmallVector<Value> ops2;
-          matBValue = vnniShuffle(rewriter, loc, matB, ipType, opType, 64, 4);
+          matBValue =
+              vnniShuffle(rewriter, loc, matB, ipType, opType, 64, 4, group);
 
           for (int i = 2, k = 0; i < 8; i += 4) {
             for (int j = 0; j < 4; j++) {
               Value op = createTileMulOutProdOp(
-                  rewriter, loc, ipType,
-                  matAValue[i], matBValue[j],
-                  ops1[k]);
+                  rewriter, loc, ipType, matAValue[i], matBValue[j], ops1[k]);
 
               k++;
               ops2.push_back(op);
             }
           }
 
-          matBValue = vnniShuffle(rewriter, loc, matB, ipType, opType, 64, 6);
+          matBValue =
+              vnniShuffle(rewriter, loc, matB, ipType, opType, 64, 6, group);
 
           for (int i = 3, k = 0; i < 8; i += 4) {
             for (int j = 0; j < 4; j++) {
               Value op = createTileMulOutProdOp(
-                  rewriter, loc, ipType,
-                  matAValue[i], matBValue[j],
-                  ops2[k]);
+                  rewriter, loc, ipType, matAValue[i], matBValue[j], ops2[k]);
 
               k++;
               ops.push_back(op);
@@ -919,20 +970,21 @@ createLoops(OpBuilder &rewriter, Location loc, Value lowerBound,
           }
         }
 
+        // Case 4: A(flat^T) x B(flat).
         if (group == 4) {
 
-          SmallVector<Value> matAValue = vnniShuffle(
-              rewriter, loc, lhsClone->getResult(0), ipType, opType, 32, 0);
+          SmallVector<Value> matAValue =
+              vnniShuffle(rewriter, loc, lhsClone->getResult(0), ipType, opType,
+                          32, 0, group);
 
           SmallVector<Value> matBValue =
-              vnniShuffle(rewriter, loc, matB, ipType, opType, 64, 0);
+              vnniShuffle(rewriter, loc, matB, ipType, opType, 64, 0, group);
 
           for (int i = 0, k = 0; i < 2; i++) {
             for (int j = 0; j < 4; j++) {
-              Value op = createTileMulOutProdOp(
-                  rewriter, loc, ipType,
-                  matAValue[i], matBValue[j],
-                  iterArgsNewInnerLoop[k]);
+              Value op =
+                  createTileMulOutProdOp(rewriter, loc, ipType, matAValue[i],
+                                         matBValue[j], iterArgsNewInnerLoop[k]);
 
               k++;
               ops.push_back(op);
@@ -940,24 +992,23 @@ createLoops(OpBuilder &rewriter, Location loc, Value lowerBound,
           }
         }
 
+        // Case 5: A(flat) x B(flat^T)
         if (group == 5) {
 
           SmallVector<Value> ops0;
 
           SmallVector<Value> matAValue =
               transposeShuffle(rewriter, loc, lhsClone->getResult(0), ipType,
-                              opType, mask1, mask2, mask3, 32, 2);
+                               opType, mask1, mask2, mask3, 32, 2);
 
-          SmallVector<Value> matBValue =
-              transposeShuffle(rewriter, loc, matB, ipType, opType,
-                              mask1, mask2, mask3, 64, 2);
+          SmallVector<Value> matBValue = transposeShuffle(
+              rewriter, loc, matB, ipType, opType, mask1, mask2, mask3, 64, 2);
 
           for (int i = 0, k = 0; i < 8; i += 4) {
             for (int j = 0; j < 16; j += 4) {
-              Value op = createTileMulOutProdOp(
-                  rewriter, loc, ipType,
-                  matAValue[i], matBValue[j],
-                  iterArgsNewInnerLoop[k]);
+              Value op =
+                  createTileMulOutProdOp(rewriter, loc, ipType, matAValue[i],
+                                         matBValue[j], iterArgsNewInnerLoop[k]);
 
               k++;
               ops0.push_back(op);
@@ -968,9 +1019,7 @@ createLoops(OpBuilder &rewriter, Location loc, Value lowerBound,
           for (int i = 1, k = 0; i < 8; i += 4) {
             for (int j = 1; j < 16; j += 4) {
               Value op = createTileMulOutProdOp(
-                  rewriter, loc, ipType,
-                  matAValue[i], matBValue[j],
-                  ops0[k]);
+                  rewriter, loc, ipType, matAValue[i], matBValue[j], ops0[k]);
 
               k++;
               ops1.push_back(op);
@@ -981,9 +1030,7 @@ createLoops(OpBuilder &rewriter, Location loc, Value lowerBound,
           for (int i = 2, k = 0; i < 8; i += 4) {
             for (int j = 2; j < 16; j += 4) {
               Value op = createTileMulOutProdOp(
-                  rewriter, loc, ipType,
-                  matAValue[i], matBValue[j],
-                  ops1[k]);
+                  rewriter, loc, ipType, matAValue[i], matBValue[j], ops1[k]);
 
               k++;
               ops2.push_back(op);
@@ -993,9 +1040,7 @@ createLoops(OpBuilder &rewriter, Location loc, Value lowerBound,
           for (int i = 3, k = 0; i < 8; i += 4) {
             for (int j = 3; j < 16; j += 4) {
               Value op = createTileMulOutProdOp(
-                  rewriter, loc, ipType,
-                  matAValue[i], matBValue[j],
-                  ops2[k]);
+                  rewriter, loc, ipType, matAValue[i], matBValue[j], ops2[k]);
 
               k++;
               ops.push_back(op);
@@ -1003,23 +1048,23 @@ createLoops(OpBuilder &rewriter, Location loc, Value lowerBound,
           }
         }
 
+        // Case 6: A(flat^T) x B(flat^T)
         if (group == 6) {
 
           SmallVector<Value> ops0;
 
           SmallVector<Value> matAValue =
-              vnniShuffle(rewriter, loc, lhsClone->getResult(0), ipType, opType, 64, 0);
+              vnniShuffle(rewriter, loc, lhsClone->getResult(0), ipType, opType,
+                          64, 0, group);
 
-          SmallVector<Value> matBValue =
-              transposeShuffle(rewriter, loc, matB, ipType, opType,
-                              mask1, mask2, mask3, 32, 2);
+          SmallVector<Value> matBValue = transposeShuffle(
+              rewriter, loc, matB, ipType, opType, mask1, mask2, mask3, 32, 2);
 
           for (int i = 0, k = 0; i < 4; i++) {
             for (int j = 0; j < 8; j += 4) {
-              Value op = createTileMulOutProdOp(
-                  rewriter, loc, ipType,
-                  matAValue[i], matBValue[j],
-                  iterArgsNewInnerLoop[k]);
+              Value op =
+                  createTileMulOutProdOp(rewriter, loc, ipType, matAValue[i],
+                                         matBValue[j], iterArgsNewInnerLoop[k]);
 
               k++;
               ops0.push_back(op);
@@ -1027,15 +1072,13 @@ createLoops(OpBuilder &rewriter, Location loc, Value lowerBound,
           }
 
           SmallVector<Value> ops1;
-          matAValue =
-              vnniShuffle(rewriter, loc, lhsClone->getResult(0), ipType, opType, 64, 2);
+          matAValue = vnniShuffle(rewriter, loc, lhsClone->getResult(0), ipType,
+                                  opType, 64, 2, group);
 
           for (int i = 0, k = 0; i < 4; i++) {
             for (int j = 1; j < 8; j += 4) {
               Value op = createTileMulOutProdOp(
-                  rewriter, loc, ipType,
-                  matAValue[i], matBValue[j],
-                  ops0[k]);
+                  rewriter, loc, ipType, matAValue[i], matBValue[j], ops0[k]);
 
               k++;
               ops1.push_back(op);
@@ -1043,37 +1086,33 @@ createLoops(OpBuilder &rewriter, Location loc, Value lowerBound,
           }
 
           SmallVector<Value> ops2;
-          matAValue =
-              vnniShuffle(rewriter, loc, lhsClone->getResult(0), ipType, opType, 64, 4);
+          matAValue = vnniShuffle(rewriter, loc, lhsClone->getResult(0), ipType,
+                                  opType, 64, 4, group);
 
           for (int i = 0, k = 0; i < 4; i++) {
             for (int j = 2; j < 8; j += 4) {
               Value op = createTileMulOutProdOp(
-                  rewriter, loc, ipType,
-                  matAValue[i], matBValue[j],
-                  ops1[k]);
+                  rewriter, loc, ipType, matAValue[i], matBValue[j], ops1[k]);
 
               k++;
               ops2.push_back(op);
             }
           }
 
-          matAValue =
-              vnniShuffle(rewriter, loc, lhsClone->getResult(0), ipType, opType, 64, 6);
+          matAValue = vnniShuffle(rewriter, loc, lhsClone->getResult(0), ipType,
+                                  opType, 64, 6, group);
 
           for (int i = 0, k = 0; i < 4; i++) {
             for (int j = 3; j < 8; j += 4) {
               Value op = createTileMulOutProdOp(
-                  rewriter, loc, ipType,
-                  matAValue[i], matBValue[j],
-                  ops2[k]);
+                  rewriter, loc, ipType, matAValue[i], matBValue[j], ops2[k]);
 
               k++;
               ops.push_back(op);
             }
           }
         }
-        
+
         scf::YieldOp::create(rewriterNewInnerLoop, locNewInnerLoop, ops);
       });
 
@@ -1229,6 +1268,38 @@ struct VectorContractToACEOuterProduct
       return rewriter.notifyMatchFailure(
           contractOp, "The accumulator read is in different block.");
 
+    Value srcBuffAcc;
+    SmallVector<Value> indicesAcc;
+
+    llvm::TypeSwitch<Operation *>(accReadOp).Case<TransferReadOp, LoadOp>(
+        [&](auto readOp) {
+          srcBuffAcc = readOp.getOperand(0);
+
+          auto indices = readOp.getIndices();
+          indicesAcc.reserve(indices.size());
+
+          llvm::transform(indices, std::back_inserter(indicesAcc),
+                          [&](OpFoldResult ofr) {
+                            return mlir::getValueOrCreateConstantIndexOp(
+                                rewriter, contractOp.getLoc(), ofr);
+                          });
+        });
+
+    auto outputShapes =
+        mlir::cast<mlir::MemRefType>(srcBuffAcc.getType()).getShape();
+    unsigned int M = outputShapes[outputShapes.size() - 2];
+    unsigned int N = outputShapes[outputShapes.size() - 1];
+
+    if ((M != 32 || N != 64) && group != 6)
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "The M tile size should be 32 and N tile size should be 64.");
+
+    if ((M != 64 || N != 32) && group == 6)
+      return rewriter.notifyMatchFailure(
+          contractOp,
+          "The M tile size should be 64 and N tile size should be 32.");
+
     unsigned int dimValue = blockingFactor;
     if (group == 3 || group == 2 || group == 5 || group == 6)
       dimValue = 4 * blockingFactor;
@@ -1293,7 +1364,7 @@ struct VectorContractToACEOuterProduct
       if (auto contract = llvm::dyn_cast<mlir::vector::ContractionOp>(op)) {
 
         LogicalResult validate = validateContractOps(
-            rewriter, contract, dimValue, srcBuffLhs, srcBuffRhs, true);
+            rewriter, contract, dimValue, srcBuffLhs, srcBuffRhs, true, ipType);
 
         if (failed(validate)) {
           return rewriter.notifyMatchFailure(
@@ -1361,7 +1432,7 @@ struct VectorContractToACEOuterProduct
                              builder.getStringAttr("private"), memrefTy,
                              initAttr3, true, IntegerAttr());
 
-    // case 2a:
+    // case 2a: Reduction loop depth is 2.
     if (loopLists.size() == 2) {
       outerLoop = loopLists[1];
       innerLoop = loopLists[0];
@@ -1415,27 +1486,6 @@ struct VectorContractToACEOuterProduct
     // Copy the amx tile accumulation results to a MemRef buffer, add the
     // initial accumulation value, and store back to the C-Matrix
     Location loc = outerLoop.getLoc();
-    Value srcBuffAcc;
-    SmallVector<Value> indicesAcc;
-
-    llvm::TypeSwitch<Operation *>(accReadOp).Case<TransferReadOp, LoadOp>(
-        [&](auto readOp) {
-          srcBuffAcc = readOp.getOperand(0);
-
-          auto indices = readOp.getIndices();
-          indicesAcc.reserve(indices.size());
-
-          llvm::transform(indices, std::back_inserter(indicesAcc),
-                          [&](OpFoldResult ofr) {
-                            return mlir::getValueOrCreateConstantIndexOp(
-                                rewriter, loc, ofr);
-                          });
-        });
-
-    auto outputShapes =
-        mlir::cast<mlir::MemRefType>(srcBuffAcc.getType()).getShape();
-    unsigned int M = outputShapes[outputShapes.size() - 2];
-    unsigned int N = outputShapes[outputShapes.size() - 1];
 
     SmallVector<Value> dps = newLoop.getResults();
     auto bufferType = MemRefType::get({16, 16}, opType);
@@ -1531,9 +1581,9 @@ struct VectorContractToACEOuterProduct
             Value shuffle2 = row2;
             Value shuffle3 = row3;
 
-            if (!isVnni) {
+            if (group == 3 || group == 4) {
               if (ipType.isBF16()) {
-                shuffle0 = vector::ShuffleOp::create(
+                /*shuffle0 = vector::ShuffleOp::create(
                     rewriter, loc, VectorType::get(16, opType), row0, row1,
                     ArrayRef<int64_t>{0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7,
                                       20, 21, 22, 23});
@@ -1551,7 +1601,47 @@ struct VectorContractToACEOuterProduct
                 shuffle3 = vector::ShuffleOp::create(
                     rewriter, loc, VectorType::get(16, opType), row2, row3,
                     ArrayRef<int64_t>{8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14,
-                                      15, 28, 29, 30, 31});
+                                      15, 28, 29, 30, 31}); */
+
+                auto a0 = vector::ShuffleOp::create(
+                    rewriter, loc, VectorType::get(16, opType), row0, row1,
+                    ArrayRef<int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19,
+                                      20, 21, 22, 23});
+
+                auto a1 = vector::ShuffleOp::create(
+                    rewriter, loc, VectorType::get(16, opType), row0, row1,
+                    ArrayRef<int64_t>{8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26,
+                                      27, 28, 29, 30, 31});
+
+                shuffle0 = vector::ShuffleOp::create(
+                    rewriter, loc, VectorType::get(16, opType), a0, a0,
+                    ArrayRef<int64_t>{0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12,
+                                      13, 14, 15});
+
+                shuffle1 = vector::ShuffleOp::create(
+                    rewriter, loc, VectorType::get(16, opType), a1, a1,
+                    ArrayRef<int64_t>{0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12,
+                                      13, 14, 15});
+
+                auto a2 = vector::ShuffleOp::create(
+                    rewriter, loc, VectorType::get(16, opType), row2, row3,
+                    ArrayRef<int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19,
+                                      20, 21, 22, 23});
+
+                auto a3 = vector::ShuffleOp::create(
+                    rewriter, loc, VectorType::get(16, opType), row2, row3,
+                    ArrayRef<int64_t>{8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26,
+                                      27, 28, 29, 30, 31});
+
+                shuffle2 = vector::ShuffleOp::create(
+                    rewriter, loc, VectorType::get(16, opType), a2, a2,
+                    ArrayRef<int64_t>{0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12,
+                                      13, 14, 15});
+
+                shuffle3 = vector::ShuffleOp::create(
+                    rewriter, loc, VectorType::get(16, opType), a3, a3,
+                    ArrayRef<int64_t>{0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7, 12,
+                                      13, 14, 15});
 
               } else {
 
